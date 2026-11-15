@@ -1,0 +1,479 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <Preferences.h>
+#include <time.h>
+#include <math.h>
+
+// ================== ПИНЫ ==================
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+// ================== WIFI ==================
+const char* WIFI_SSID = "xxxxx";
+const char* WIFI_PASS = "xxxxx";
+
+// ================== TELEGRAM ==================
+const char* BOT_TOKEN = "xxxxxx";
+const char* CHAT_ID   = "xxxxxx";
+
+// ================== УЛЬТРАЗВУК ==================
+#define TIMEOUT_US 65000
+#define SOUND_SPEED 0.0343f
+
+// ================== ОБЪЕКТЫ ==================
+WiFiClientSecure tgClient;
+UniversalTelegramBot bot(BOT_TOKEN, tgClient);
+Preferences prefs;
+
+// ================== КАЛИБРОВКА ==================
+float lowDist  = -1.0f;   // 0%
+float highDist = 21.0f;   // 100% (дефолт)
+
+// ================== УВЕДОМЛЕНИЯ ==================
+const int thresholds[] = {50, 75, 85, 90, 95, 99};
+bool thresholdSent[sizeof(thresholds)/sizeof(thresholds[0])] = {false};
+const float HYST = 2.0f;
+
+// ================== TELEGRAM POLL ==================
+unsigned long lastBotPoll = 0;
+const unsigned long BOT_POLL_MS = 1200;
+long lastUpdateId = 0;
+
+// ================== ИСТОРИЯ ДЛЯ ГРАФИКА ==================
+const float LOG_STEP_PCT = 2.0f;     // пишем точку, если % изменился >= 2
+const int MAX_POINTS = 220;          // хранение в RAM
+
+struct Sample {
+  uint32_t epoch;   // UNIX time (сек), реальное время
+  uint16_t pct10;   // % * 10
+};
+
+Sample hist[MAX_POINTS];
+int histCount = 0;
+
+bool hasLastLogged = false;
+float lastLoggedPct = 0.0f;
+
+// ================== TIME (NTP) ==================
+bool timeOk = false;
+
+// Для Европы/Стокгольма (CET/CEST):
+// CET-1, CEST (DST) с последнего воскресенья марта 02:00 до последнего воскресенья октября 03:00
+void setupTime() {
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
+
+  // gmtOffset/daylightOffset = 0, т.к. TZ задаёт смещение
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+
+  // Пытаемся быстро получить время
+  for (int i = 0; i < 30; i++) {
+    time_t now = time(nullptr);
+    if (now > 1700000000) { // после 2023 года => время синхронизировалось
+      timeOk = true;
+      return;
+    }
+    delay(200);
+  }
+  timeOk = false;
+}
+
+uint32_t nowEpoch() {
+  time_t now = time(nullptr);
+  if (now > 1700000000) return (uint32_t)now;
+  return 0;
+}
+
+String fmtHHMM(uint32_t epoch) {
+  if (epoch == 0) return "??:??";
+  struct tm t;
+  localtime_r((time_t*)&epoch, &t);
+  char buf[6];
+  strftime(buf, sizeof(buf), "%H:%M", &t);
+  return String(buf);
+}
+
+// ---------- измерение расстояния (медиана + фильтр) ----------
+float readDistanceCm() {
+  const int readings = 15;
+  float dists[readings];
+  int valid = 0;
+
+  for (int i = 0; i < readings; i++) {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long dur = pulseIn(ECHO_PIN, HIGH, TIMEOUT_US);
+    if (dur > 0) {
+      float d = dur * SOUND_SPEED / 2.0f;  // см
+      if (d > 2 && d < 600) {
+        dists[valid++] = d;
+      }
+    }
+    delay(30);
+  }
+
+  if (valid == 0) return -1.0f;
+
+  for (int i = 0; i < valid - 1; i++) {
+    for (int j = i + 1; j < valid; j++) {
+      if (dists[j] < dists[i]) {
+        float t = dists[i];
+        dists[i] = dists[j];
+        dists[j] = t;
+      }
+    }
+  }
+  return dists[valid / 2];
+}
+
+// ---------- процент заполнения ----------
+float calcPercent(float distCm) {
+  if (distCm < 0) return -1.0f;
+  if (lowDist <= 0) return -1.0f;
+  if (lowDist <= highDist + 0.1f) return -1.0f;
+
+  float p = (lowDist - distCm) * 100.0f / (lowDist - highDist);
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+  return p;
+}
+
+// ---------- Telegram send ----------
+void tgSend(const String& text) {
+  bot.sendMessage(CHAT_ID, text, "");
+}
+
+// ---------- сохранить/загрузить калибровку ----------
+void loadCalibration() {
+  prefs.begin("smartwater", true);
+  lowDist  = prefs.getFloat("low", -1.0f);
+  highDist = prefs.getFloat("high", 21.0f);
+  prefs.end();
+}
+
+void saveCalibration() {
+  prefs.begin("smartwater", false);
+  prefs.putFloat("low", lowDist);
+  prefs.putFloat("high", highDist);
+  prefs.end();
+}
+
+// ---------- парсер "/set_low 312.5" ----------
+bool parseNumberArg(const String& text, float &outVal) {
+  int sp = text.indexOf(' ');
+  if (sp < 0) return false;
+  String arg = text.substring(sp + 1);
+  arg.trim();
+  if (arg.length() == 0) return false;
+  outVal = arg.toFloat();
+  return (outVal > 0.1f);
+}
+
+// ---------- история ----------
+void clearHistory() {
+  histCount = 0;
+  hasLastLogged = false;
+  lastLoggedPct = 0.0f;
+}
+
+void addHistoryPointIfNeeded(float pct) {
+  if (pct < 0) return;
+
+  // первая точка записывается сразу
+  if (!hasLastLogged) {
+    hasLastLogged = true;
+    lastLoggedPct = pct;
+  } else {
+    if (fabs(pct - lastLoggedPct) < LOG_STEP_PCT) return;
+    lastLoggedPct = pct;
+  }
+
+  uint32_t ep = nowEpoch();          // реальное время
+  uint16_t pct10 = (uint16_t)lroundf(pct * 10.0f);
+
+  if (histCount < MAX_POINTS) {
+    hist[histCount++] = { ep, pct10 };
+  } else {
+    for (int i = 1; i < MAX_POINTS; i++) hist[i - 1] = hist[i];
+    hist[MAX_POINTS - 1] = { ep, pct10 };
+  }
+}
+
+// ---------- уведомления ----------
+void updateThresholdFlags(float percent) {
+  for (size_t i = 0; i < sizeof(thresholds)/sizeof(thresholds[0]); i++) {
+    if (thresholdSent[i] && percent < (thresholds[i] - HYST)) {
+      thresholdSent[i] = false;
+    }
+  }
+}
+
+void checkAndNotify(float percent, float distCm) {
+  if (percent < 0) return;
+
+  updateThresholdFlags(percent);
+
+  for (size_t i = 0; i < sizeof(thresholds)/sizeof(thresholds[0]); i++) {
+    int th = thresholds[i];
+    if (!thresholdSent[i] && percent >= (float)th) {
+      thresholdSent[i] = true;
+
+      String msg = "Заполнение достигло " + String(th) + "%.\n";
+      msg += "Сейчас: " + String(percent, 1) + "%, расстояние: " + String(distCm, 1) + " см.\n";
+      msg += "Калибровка: Нижняя точка=" + String(lowDist, 1) + " см, Верхняя точка=" + String(highDist, 1) + " см.";
+      tgSend(msg);
+    }
+  }
+}
+
+// ---------- URL encode ----------
+String urlEncode(const String& s) {
+  String out;
+  const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '_' || c == '.' || c == '~';
+    if (ok) out += (char)c;
+    else {
+      out += '%';
+      out += hex[(c >> 4) & 0xF];
+      out += hex[c & 0xF];
+    }
+  }
+  return out;
+}
+
+// ---------- sendPhoto по URL ----------
+bool tgSendPhotoUrl(const String& photoUrl, const String& caption) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  if (!client.connect("api.telegram.org", 443)) return false;
+
+  String path = "/bot" + String(BOT_TOKEN) + "/sendPhoto?chat_id=" + String(CHAT_ID) +
+                "&photo=" + urlEncode(photoUrl) +
+                "&caption=" + urlEncode(caption);
+
+  client.print(String("GET ") + path + " HTTP/1.1\r\n"
+               "Host: api.telegram.org\r\n"
+               "Connection: close\r\n\r\n");
+
+  unsigned long t0 = millis();
+  while (client.connected() && millis() - t0 < 5000) {
+    while (client.available()) client.read();
+    delay(10);
+  }
+  client.stop();
+  return true;
+}
+
+// ---------- QuickChart URL (labels = HH:MM, Y = %) ----------
+String buildQuickChartUrl(int maxPointsForGraph) {
+  if (histCount < 2) return "";
+
+  int n = histCount;
+  int step = 1;
+  if (n > maxPointsForGraph) step = (n + maxPointsForGraph - 1) / maxPointsForGraph;
+
+  // labels и data одинаковой длины
+  String labels = "";
+  String data = "";
+
+  int added = 0;
+  for (int i = 0; i < histCount; i += step) {
+    String lab = fmtHHMM(hist[i].epoch);
+    float y = hist[i].pct10 / 10.0f;
+
+    if (added > 0) { labels += ","; data += ","; }
+    labels += "\"" + lab + "\"";
+    data += String(y, 1);
+    added++;
+  }
+
+  // Надёжный JSON-конфиг (без time scale)
+  String cfg =
+    "{"
+      "\"type\":\"line\","
+      "\"data\":{"
+        "\"labels\":[" + labels + "],"
+        "\"datasets\":[{"
+          "\"data\":[" + data + "],"
+          "\"fill\":false,"
+          "\"tension\":0.25"
+        "}]"
+      "},"
+      "\"options\":{"
+        "\"plugins\":{\"legend\":{\"display\":false}},"
+        "\"scales\":{"
+          "\"y\":{"
+            "\"min\":0,\"max\":100,"
+            "\"title\":{\"display\":true,\"text\":\"fill (%)\"}"
+          "},"
+          "\"x\":{"
+            "\"title\":{\"display\":true,\"text\":\"time\"},"
+            "\"ticks\":{\"autoSkip\":true,\"maxTicksLimit\":6}"
+          "}"
+        "}"
+      "}"
+    "}";
+
+  String url = "https://quickchart.io/chart?format=png&width=900&height=420&c=" + urlEncode(cfg);
+  return url;
+}
+
+// ---------- обработка Telegram ----------
+void handleTelegram() {
+  int numNew = bot.getUpdates(lastUpdateId + 1);
+  while (numNew) {
+    for (int i = 0; i < numNew; i++) {
+      lastUpdateId = bot.messages[i].update_id;
+
+      String chat_id = bot.messages[i].chat_id;
+      if (chat_id != String(CHAT_ID)) continue;
+
+      String text = bot.messages[i].text;
+      text.trim();
+
+      float dist = readDistanceCm();
+      float pct  = calcPercent(dist);
+
+      if (text.startsWith("/distance")) {
+        if (dist < 0) tgSend("Расстояние: --- (нет измерения)");
+        else tgSend("Расстояние: " + String(dist, 1) + " см");
+      }
+      else if (text.startsWith("/status")) {
+        String msg = "Статус:\n";
+        if (pct < 0) {
+          msg += "Заполнение: ---\n";
+          msg += "Калибровка не готова. Сделай /set_low.\n";
+          if (dist > 0) msg += "Расстояние: " + String(dist, 1) + " см\n";
+          msg += "Верхняя точка по умолчанию: 21 см\n";
+        } else {
+          msg += "Заполнение: " + String(pct, 1) + "%\n";
+          msg += "Расстояние: " + String(dist, 1) + " см\n";
+          msg += "Калибровка: Нижняя точка=" + String(lowDist, 1) + " см, Верхняя точка=" + String(highDist, 1) + " см.\n";
+        }
+        msg += "Точек истории: " + String(histCount) + " (шаг: 2%)\n";
+        msg += String("Время NTP: ") + (timeOk ? "OK" : "нет");
+        tgSend(msg);
+      }
+      else if (text.startsWith("/set_low")) {
+        float v;
+        if (parseNumberArg(text, v)) lowDist = v;
+        else lowDist = dist;
+
+        if (lowDist <= 0) {
+          tgSend("Ошибка /set_low: нет корректного измерения.");
+        } else {
+          saveCalibration();
+          clearHistory();
+          tgSend("Нижняя точка установлена: " + String(lowDist, 1) + " см (0%).\nИстория графика начата заново.");
+        }
+      }
+      else if (text.startsWith("/set_high")) {
+        float v;
+        if (parseNumberArg(text, v)) highDist = v;
+        else highDist = (dist > 0 ? dist : 21.0f);
+
+        if (highDist <= 0) highDist = 21.0f;
+        saveCalibration();
+        clearHistory();
+        tgSend("Верхняя точка установлена: " + String(highDist, 1) + " см (100%).\nИстория графика начата заново.");
+      }
+      else if (text.startsWith("/graph")) {
+        if (histCount < 2) {
+          tgSend("Для графика нужно хотя бы 2 точки.\nТочка добавляется при изменении >= 2%.");
+        } else {
+          String url = buildQuickChartUrl(80); // 80 точек достаточно, чтобы URL не раздувался
+          String cap = "График заполнения (ось X = реальное время замера)\nТочек: " + String(histCount);
+          bool ok = tgSendPhotoUrl(url, cap);
+          if (!ok) tgSend("Не удалось отправить график (проверь Wi-Fi/интернет).");
+        }
+      }
+      else if (text.startsWith("/reset")) {
+        lowDist = -1.0f;
+        highDist = 21.0f;
+
+        prefs.begin("smartwater", false);
+        prefs.clear();
+        prefs.end();
+
+        for (size_t k = 0; k < sizeof(thresholdSent)/sizeof(thresholdSent[0]); k++) {
+          thresholdSent[k] = false;
+        }
+
+        clearHistory();
+        tgSend("Сброс выполнен.\nКалибровка очищена (high=21 см).\nИстория графика очищена. Сделай /set_low.");
+      }
+      else {
+        tgSend(
+          "Команды:\n"
+          "/status\n"
+          "/distance\n"
+          "/set_low [cm]\n"
+          "/set_high [cm]\n"
+          "/graph\n"
+          "/reset\n\n"
+          "График: новая точка только при изменении >= 2%."
+        );
+      }
+    }
+
+    numNew = bot.getUpdates(lastUpdateId + 1);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  loadCalibration();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(300);
+  }
+
+  tgClient.setInsecure();
+
+  setupTime();     // NTP (реальное время)
+  clearHistory();  // новая сессия графика
+
+  tgSend(
+    "SmartWaterCheck включен.\n"
+    "/status /distance /set_low /set_high /graph /reset\n"
+    "График: точка при изменении >= 2%.\n"
+    "Время NTP: " + String(timeOk ? "OK" : "нет")
+  );
+}
+
+void loop() {
+  static unsigned long lastMeasure = 0;
+
+  if (millis() - lastMeasure > 1500) {
+    lastMeasure = millis();
+
+    float dist = readDistanceCm();
+    float pct  = calcPercent(dist);
+
+    // история (только при изменении >= 2%)
+    if (pct >= 0) addHistoryPointIfNeeded(pct);
+
+    // уведомления
+    checkAndNotify(pct, dist);
+  }
+
+  if (WiFi.status() == WL_CONNECTED && millis() - lastBotPoll > BOT_POLL_MS) {
+    lastBotPoll = millis();
+    handleTelegram();
+  }
+}
