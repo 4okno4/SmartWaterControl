@@ -61,7 +61,6 @@ Cистема автоматизированного контроля уровн
 - UniversalTelegramBot — работаем напрямую с Telegram API через Wi-Fi модуль на ESP, Telegram используем, чтобы не создавать отдельный сервер.
 - WiFi.h (ESP32 core) — Wi-Fi.
 - WiFiClientSecure.h (ESP32 core) — защищённое соединение с Telegram.
-- UniversalTelegramBot — Telegram-бот.
 - ArduinoJson — зависимость UniversalTelegramBot (парсинг JSON).
 - Preferences.h (ESP32 core) — хранение калибровки.
 - time.h, math.h — стандартные.
