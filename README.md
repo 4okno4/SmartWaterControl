@@ -59,8 +59,14 @@ Cистема автоматизированного контроля уровн
 
 ### Библиотеки
 - UniversalTelegramBot — работаем напрямую с Telegram API через Wi-Fi модуль на ESP, Telegram используем, чтобы не создавать отдельный сервер.
-- Библиотека LoRa.h для связи модулей ESP32
-- !!Остальные библиотеки будут дописаны!!
+- WiFi.h (ESP32 core) — Wi-Fi.
+- WiFiClientSecure.h (ESP32 core) — защищённое соединение с Telegram.
+- UniversalTelegramBot — Telegram-бот.
+- ArduinoJson — зависимость UniversalTelegramBot (парсинг JSON).
+- Preferences.h (ESP32 core) — хранение калибровки.
+- time.h, math.h — стандартные.
+- LoRa.h (например, Sandeep Mistry) — радиоканал LoRa.
+- SPI.h (ESP32 core) — шина SPI для LoRa.
 
 ## Детали для проекта
 1. ESP32; Модуль ESP32 TYPE-C CH340C, Wi-Fi + Bluetooth — В количестве 2 штук (1 на первый модуль, 1 на второй модуль) 
